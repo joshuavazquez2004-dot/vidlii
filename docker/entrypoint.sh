@@ -108,8 +108,7 @@ if [ "$HAS_USERS" = "0" ]; then
     fi
     ADMIN_HASH="$(php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$ADMIN_PASS")"
 
-    mariadb --socket="$SOCKET" -u root "$DB_NAME" <<SQL
-INSERT INTO options (option_name, value) VALUES ('title', 'VidLii'), ('slogan', 'Display Yourself!');
+    mariadb --socket="$SOCKET" -u root "$DB_NAME" <<SQL || log "WARNING: could not create the initial admin account"
 INSERT INTO users (username, displayname, email, password, reg_date, last_login, birthday, \`1st_latest_ip\`, country, partner, is_admin, is_mod)
 VALUES ('$ADMIN_USERNAME', '$ADMIN_USERNAME', '$ADMIN_EMAIL', '$ADMIN_HASH', NOW(), NOW(), '1910-01-01', '127.0.0.1', 'US', 1, 1, 1);
 SQL
@@ -131,6 +130,8 @@ db = "$DB_NAME"
 username = "$DB_USER"
 password = "$DB_PASS"
 uploadLimit = $UPLOAD_LIMIT
+title = "${SITE_TITLE:-VidLii}"
+slogan = "${SITE_SLOGAN:-Display Yourself!}"
 ENVFILE
 chmod 600 "$APP_ROOT/.env"
 
