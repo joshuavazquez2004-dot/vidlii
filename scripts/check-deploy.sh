@@ -64,6 +64,19 @@ echo "== php =="
 has  docker/php.ini 'short_open_tag\s*=\s*On'                    "short_open_tag is enabled for the legacy templates"
 has  docker/www.conf 'listen\s*=\s*127\.0\.0\.1:9000'              "php-fpm listens on 9000"
 
+echo "== media placeholders =="
+for f in vi/ava/default.jpg vi/default.jpg; do
+    if [ -s "$f" ]; then
+        ok "$f ships a non-empty placeholder image"
+    else
+        bad "$f is missing or empty"
+    fi
+done
+has  docker/nginx.conf 'location \^~ /vi/ava/'                    "avatar requests are matched before the dotfile deny rule"
+has  docker/nginx.conf 'try_files [$]uri /vi/ava/default[.]jpg'    "missing avatars serve the shipped placeholder"
+has  docker/nginx.conf 'try_files [$]uri /vi/default[.]jpg'        "missing thumbnails serve the shipped placeholder"
+has  _includes/PHPfunctions.php 'AvatarName = '                    "avatar helper never emits an empty avatar filename"
+
 echo "== image =="
 has  Dockerfile '^FROM php:[0-9.]+-fpm-alpine'                    "final image is Alpine based"
 lacks Dockerfile '^FROM .*(slim|bookworm|bullseye|debian)'        "no Debian-based stage is used"
