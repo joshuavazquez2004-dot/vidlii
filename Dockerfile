@@ -11,6 +11,8 @@ RUN echo "os-refresh 2026-11-18" && apk upgrade --no-cache && apk add --no-cache
       mariadb-client \
       ffmpeg \
       tzdata \
+      icu-libs \
+      libzip \
       icu-dev \
       libpng-dev \
       libjpeg-turbo-dev \
