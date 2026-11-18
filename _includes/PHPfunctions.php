@@ -417,12 +417,14 @@
 		}
 
 		function user_avatar($User,$Width,$Height,$Avatar,$Border = "") {
-			$Avatar = "/vi/ava/$User.jpg";
+			$AvatarName = ($User === "" || $User === null) ? "default" : $User;
+			$Avatar = "/vi/ava/$AvatarName.jpg";
 			return '<a href="/user/'.$User.'"><img src="'.$Avatar.'" width="'.$Width.'" loading="lazy" height="'.$Height.'" class="avt '.$Border.'" alt="'.$User.'"></a>';
 		}
 
 		function user_avatar2($User,$Width,$Height,$Avatar,$Extra_Class = "") {
-			$Avatar = "/vi/ava/$User.jpg";
+			$AvatarName = ($User === "" || $User === null) ? "default" : $User;
+			$Avatar = "/vi/ava/$AvatarName.jpg";
 			return '<a href="/user/'.$User.'"><img src="'.$Avatar.'" width="'.$Width.'" height="'.$Height.'" class="avt2 '.$Extra_Class.'" alt="'.$User.'"></a>';
 		}
 
