@@ -62,7 +62,7 @@ has  docker/nginx.conf 'client_body_temp_path /tmp/nginx'        "nginx temp pat
 
 echo "== php =="
 has  docker/php.ini 'short_open_tag\s*=\s*On'                    "short_open_tag is enabled for the legacy templates"
-has  docker/www.conf 'listen\s*=\s*9000'                         "php-fpm listens on 9000"
+has  docker/www.conf 'listen\s*=\s*127\.0\.0\.1:9000'              "php-fpm listens on 9000"
 
 echo "== image =="
 has  Dockerfile '^FROM php:[0-9.]+-fpm-alpine'                    "final image is Alpine based"
@@ -108,9 +108,11 @@ fi
 echo "== php syntax =="
 php_files=0
 php_bad=0
+# The legacy templates rely on <? short tags, so lint with short_open_tag=On,
+# matching docker/php.ini. Without it php -l misreads ?> and reports false errors.
 for f in $(find . -name '*.php' -not -path './vendor/*' -not -path './.git/*'); do
     php_files=$((php_files + 1))
-    if ! php -l "$f" >/dev/null 2>&1; then
+    if ! php -d short_open_tag=On -l "$f" >/dev/null 2>&1; then
         php_bad=$((php_bad + 1))
         printf 'FAIL - php syntax error in %s\n' "$f"
     fi
@@ -121,8 +123,8 @@ else
     bad "$php_bad of $php_files PHP files failed php -l"
 fi
 
-echo "== routes =="
-has index.php 'index\.php' "front controller entry point exists"
+echo "== front controller =="
+has index.php 'vendor/autoload\.php' "index.php boots through the Composer autoloader"
 
 if [ "$fail" -ne 0 ]; then
     echo "RESULT: FAILED"
