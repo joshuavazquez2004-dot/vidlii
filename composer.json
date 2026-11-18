@@ -24,6 +24,9 @@
             "Vidlii\\Vidlii\\API\\": "src/api/"
         }
     },
+    "scripts": {
+        "test": "sh scripts/check-deploy.sh"
+    },
     "config": {
         "allow-plugins": {
             "php-http/discovery": true
