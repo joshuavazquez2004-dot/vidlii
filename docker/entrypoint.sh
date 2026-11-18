@@ -136,9 +136,9 @@ ENVFILE
 chmod 600 "$APP_ROOT/.env"
 
 # --- PHP-FPM + nginx --------------------------------------------------------
-if grep -q "listen 8080;" /etc/nginx/nginx.conf; then
-    sed -i "s/listen 8080;/listen $PORT;/" /etc/nginx/nginx.conf
-fi
+# The container runs as a non-root user, so the listen port is rendered into a
+# writable copy of the config rather than editing /etc/nginx/nginx.conf.
+sed "s/listen 8080;/listen $PORT;/" /etc/nginx/nginx.conf > /tmp/nginx.conf
 
 log "starting PHP-FPM and nginx on port $PORT"
 php-fpm -F -y /usr/local/etc/php-fpm.conf &
@@ -152,4 +152,4 @@ while [ "$i" -lt 30 ]; do
     sleep 1
 done
 
-exec nginx -c /etc/nginx/nginx.conf -g 'daemon off;'
+exec nginx -c /tmp/nginx.conf -g 'daemon off;'
