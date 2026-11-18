@@ -22,10 +22,6 @@ return [
         'Atlantic/Reykjavik' => 'Gwzlinzveihci Byauhcunj Sizgenh (Reykjavik)',
         'Atlantic/St_Helena' => 'Gwzlinzveihci Byauhcunj Sizgenh (St. Helena)',
         'Etc/GMT' => 'Gwzlinzveihci Byauhcunj Sizgenh',
-        'Europe/Guernsey' => 'Gwzlinzveihci Byauhcunj Sizgenh (Guernsey)',
-        'Europe/Isle_of_Man' => 'Gwzlinzveihci Byauhcunj Sizgenh (Isle of Man)',
-        'Europe/Jersey' => 'Gwzlinzveihci Byauhcunj Sizgenh (Jersey)',
-        'Europe/London' => 'Gwzlinzveihci Byauhcunj Sizgenh (London)',
     ],
     'Meta' => [],
 ];

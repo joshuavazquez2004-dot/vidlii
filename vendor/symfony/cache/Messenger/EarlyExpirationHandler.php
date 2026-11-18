@@ -28,7 +28,10 @@ class EarlyExpirationHandler
     ) {
     }
 
-    public function __invoke(EarlyExpirationMessage $message): void
+    /**
+     * @return EarlyExpirationResult|null
+     */
+    public function __invoke(EarlyExpirationMessage $message)
     {
         $item = $message->getItem();
         $metadata = $item->getMetadata();
@@ -38,16 +41,16 @@ class EarlyExpirationHandler
         if ($expiry && $ctime) {
             // skip duplicate or expired messages
 
-            $processingNonce = [$expiry, $ctime];
+            $processingNonce = (object) ['value' => [$expiry, $ctime]];
             $pool = $message->getPool();
             $key = $item->getKey();
 
-            if (($this->processedNonces[$pool][$key] ?? null) === $processingNonce) {
-                return;
+            if (($this->processedNonces[$pool][$key]->value ?? null) === $processingNonce->value) {
+                return null;
             }
 
             if (microtime(true) >= $expiry) {
-                return;
+                return null;
             }
 
             $this->processedNonces[$pool] = [$key => $processingNonce] + ($this->processedNonces[$pool] ?? []);
@@ -60,7 +63,7 @@ class EarlyExpirationHandler
         static $setMetadata;
 
         $setMetadata ??= \Closure::bind(
-            function (CacheItem $item, float $startTime) {
+            static function (CacheItem $item, float $startTime) {
                 if ($item->expiry > $endTime = microtime(true)) {
                     $item->newMetadata[CacheItem::METADATA_EXPIRY] = $item->expiry;
                     $item->newMetadata[CacheItem::METADATA_CTIME] = (int) ceil(1000 * ($endTime - $startTime));
@@ -70,12 +73,28 @@ class EarlyExpirationHandler
             CacheItem::class
         );
 
-        $startTime = microtime(true);
-        $pool = $message->findPool($this->reverseContainer);
-        $callback = $message->findCallback($this->reverseContainer);
-        $save = true;
-        $value = $callback($item, $save);
-        $setMetadata($item, $startTime);
-        $pool->save($item->set($value));
+        try {
+            $startTime = microtime(true);
+            $pool = $message->findPool($this->reverseContainer);
+            $callback = $message->findCallback($this->reverseContainer);
+            $save = true;
+            $item->set($callback($item, $save));
+
+            if ($save) {
+                $setMetadata($item, $startTime);
+                $pool->save($item);
+            }
+
+            return new EarlyExpirationResult($item);
+        } catch (\Throwable $e) {
+            $pool = $message->getPool();
+            $key = $item->getKey();
+
+            if (isset($processingNonce) && ($this->processedNonces[$pool][$key] ?? null) === $processingNonce) {
+                unset($this->processedNonces[$pool][$key]);
+            }
+
+            throw $e;
+        }
     }
 }

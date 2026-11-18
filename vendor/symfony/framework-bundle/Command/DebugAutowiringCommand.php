@@ -20,6 +20,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Style\SymfonyStyle;
+use Symfony\Component\DependencyInjection\Exception\ServiceNotFoundException;
 use Symfony\Component\ErrorHandler\ErrorRenderer\FileLinkFormatter;
 
 /**
@@ -73,7 +74,7 @@ class DebugAutowiringCommand extends ContainerDebugCommand
         if ($search = $input->getArgument('search')) {
             $searchNormalized = preg_replace('/[^a-zA-Z0-9\x7f-\xff $]++/', '', $search);
 
-            $serviceIds = array_filter($serviceIds, fn ($serviceId) => false !== stripos(str_replace('\\', '', $serviceId), $searchNormalized) && !str_starts_with($serviceId, '.'));
+            $serviceIds = array_filter($serviceIds, static fn ($serviceId) => false !== stripos(str_replace('\\', '', $serviceId), $searchNormalized) && !str_starts_with($serviceId, '.'));
 
             if (!$serviceIds) {
                 $errorIo->error(\sprintf('No autowirable classes or interfaces found matching "%s"', $search));
@@ -104,6 +105,13 @@ class DebugAutowiringCommand extends ContainerDebugCommand
         foreach ($serviceIds as $serviceId) {
             if ($container->hasDefinition($serviceId) && $container->getDefinition($serviceId)->hasTag('container.excluded')) {
                 continue;
+            }
+            try {
+                if ($container->findDefinition($serviceId)->isAbstract()) {
+                    continue;
+                }
+            } catch (ServiceNotFoundException) {
+                // the alias targets a service that was removed, it is listed as is
             }
             $text = [];
             $resolvedServiceId = $serviceId;

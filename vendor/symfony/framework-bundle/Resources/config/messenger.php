@@ -219,6 +219,7 @@ return static function (ContainerConfigurator $container) {
             ->args([
                 abstract_arg('failure transports'),
                 service('logger')->ignoreOnInvalid(),
+                abstract_arg('failure transports by name'),
             ])
             ->tag('kernel.event_subscriber')
             ->tag('monolog.logger', ['channel' => 'messenger'])
@@ -255,6 +256,6 @@ return static function (ContainerConfigurator $container) {
             ->args([
                 service('messenger.default_bus'),
             ])
-            ->tag('messenger.message_handler')
+            ->tag('messenger.message_handler', ['sign' => true])
     ;
 };

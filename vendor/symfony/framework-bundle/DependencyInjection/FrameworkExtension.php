@@ -62,6 +62,7 @@ use Symfony\Component\Console\Debug\CliRequest;
 use Symfony\Component\Console\Messenger\RunCommandMessageHandler;
 use Symfony\Component\DependencyInjection\Alias;
 use Symfony\Component\DependencyInjection\Argument\ArgumentTrait;
+use Symfony\Component\DependencyInjection\Argument\BoundArgument;
 use Symfony\Component\DependencyInjection\Argument\IteratorArgument;
 use Symfony\Component\DependencyInjection\Argument\ServiceLocatorArgument;
 use Symfony\Component\DependencyInjection\ChildDefinition;
@@ -116,6 +117,7 @@ use Symfony\Component\HttpKernel\Log\DebugLoggerConfigurator;
 use Symfony\Component\HttpKernel\Profiler\ProfilerStateChecker;
 use Symfony\Component\JsonStreamer\Attribute\JsonStreamable;
 use Symfony\Component\JsonStreamer\JsonStreamWriter;
+use Symfony\Component\JsonStreamer\Mapping\PropertyMetadata;
 use Symfony\Component\JsonStreamer\StreamReaderInterface;
 use Symfony\Component\JsonStreamer\StreamWriterInterface;
 use Symfony\Component\JsonStreamer\ValueTransformer\ValueTransformerInterface;
@@ -179,6 +181,7 @@ use Symfony\Component\RateLimiter\RateLimiterFactoryInterface;
 use Symfony\Component\RateLimiter\Storage\CacheStorage;
 use Symfony\Component\RemoteEvent\Attribute\AsRemoteEventConsumer;
 use Symfony\Component\RemoteEvent\RemoteEvent;
+use Symfony\Component\Routing\Annotation\Route as LegacyRoute;
 use Symfony\Component\Routing\Attribute\Route;
 use Symfony\Component\Routing\Loader\AttributeServicesLoader;
 use Symfony\Component\Routing\Loader\XmlFileLoader as RoutingXmlFileLoader;
@@ -258,6 +261,8 @@ use Symfony\Contracts\Translation\LocaleAwareInterface;
  */
 class FrameworkExtension extends Extension
 {
+    private const MAPPING_FILE_PATTERN = '/\.(xml|ya?ml)$/';
+
     private array $configsEnabled = [];
 
     /**
@@ -289,6 +294,10 @@ class FrameworkExtension extends Extension
         }
 
         $container->registerAliasForArgument('parameter_bag', PsrContainerInterface::class);
+
+        if (!ContainerBuilder::willBeAvailable('symfony/expression-language', ExpressionLanguage::class, ['symfony/framework-bundle'])) {
+            $container->removeDefinition('controller.expression_language');
+        }
 
         $loader->load('process.php');
 
@@ -331,6 +340,12 @@ class FrameworkExtension extends Extension
 
         if (!interface_exists(NamespacedPoolInterface::class)) {
             $container->removeAlias(NamespacedPoolInterface::class);
+        }
+
+        if ($container->getParameter('kernel.debug')) {
+            // clears the pools that cache metadata read from mapping files, so that editing one of
+            // these files is enough to refresh them
+            $loader->load('cache_debug.php');
         }
 
         $configuration = $this->getConfiguration($configs, $container);
@@ -649,6 +664,31 @@ class FrameworkExtension extends Extension
         // profiler depends on form, validation, translation, messenger, mailer, http-client, notifier, serializer being registered. console is optional
         $this->registerProfilerConfiguration($config['profiler'], $container, $loader);
 
+        // These listeners keep every message, attachments included, for the
+        // lifetime of the process. Only the profiler and the test assertions
+        // consume them, so drop them when neither is around, and let them skip
+        // messages nobody will collect otherwise. Test mode keeps collecting
+        // unconditionally because the assertions read the listeners directly.
+        if (!($config['test'] ?? false)) {
+            $loggerListeners = [
+                'mailer' => 'mailer.message_logger_listener',
+                'notifier' => 'notifier.notification_logger_listener',
+            ];
+
+            foreach ($loggerListeners as $extension => $id) {
+                if (!$this->isInitializedConfigEnabled($extension)) {
+                    continue;
+                }
+
+                if ($this->isInitializedConfigEnabled('profiler')) {
+                    $container->getDefinition($id)
+                        ->setArgument(0, new Reference('profiler.is_disabled_state_checker', ContainerInterface::NULL_ON_INVALID_REFERENCE));
+                } else {
+                    $container->removeDefinition($id);
+                }
+            }
+        }
+
         if ($this->readConfigEnabled('webhook', $container, $config['webhook'])) {
             $this->registerWebhookConfiguration($config['webhook'], $container, $loader, $this->readConfigEnabled('serializer', $container, $config['serializer']));
 
@@ -663,7 +703,7 @@ class FrameworkExtension extends Extension
             }
         }
 
-        if ($this->readConfigEnabled('remote-event', $container, $config['remote-event'])) {
+        if ($this->readConfigEnabled('remote_event', $container, $config['remote_event'])) {
             $this->registerRemoteEventConfiguration($loader);
         }
 
@@ -791,6 +831,9 @@ class FrameworkExtension extends Extension
             $definition->addTag('controller.service_arguments');
         });
         $container->registerAttributeForAutoconfiguration(Route::class, static function (ChildDefinition $definition, Route $attribute, \ReflectionClass|\ReflectionMethod $reflection): void {
+            $definition->addTag('controller.service_arguments')->addTag('routing.controller');
+        });
+        $container->registerAttributeForAutoconfiguration(LegacyRoute::class, static function (ChildDefinition $definition, Route $attribute, \ReflectionClass|\ReflectionMethod $reflection): void {
             $definition->addTag('controller.service_arguments')->addTag('routing.controller');
         });
         $container->registerAttributeForAutoconfiguration(AsRemoteEventConsumer::class, static function (ChildDefinition $definition, AsRemoteEventConsumer $attribute): void {
@@ -1011,7 +1054,6 @@ class FrameworkExtension extends Extension
 
         $loader->load('profiling.php');
         $loader->load('collectors.php');
-        $loader->load('cache_debug.php');
 
         if (!class_exists(ProfilerStateChecker::class)) {
             $container->removeDefinition('profiler.state_checker');
@@ -1382,8 +1424,7 @@ class FrameworkExtension extends Extension
         $container->setParameter('request_listener.https_port', $config['https_port']);
 
         if (null !== $config['default_uri']) {
-            $container->getDefinition('router.request_context')
-                ->replaceArgument(0, $config['default_uri']);
+            $container->setParameter('router.request_context.base_url', $config['default_uri']);
         }
     }
 
@@ -1407,6 +1448,7 @@ class FrameworkExtension extends Extension
         }
 
         $container->setParameter('session.storage.options', $options);
+        $container->setParameter('session.metadata.cookie_lifetime', $options['cookie_lifetime'] ?? null);
 
         // session handler (the internal callback registered with PHP session management)
         if (null === ($config['handler_id'] ?? $config['save_path'] ?? null)) {
@@ -1460,6 +1502,9 @@ class FrameworkExtension extends Extension
         $defaultPackage = $this->createPackageDefinition($config['base_path'], $config['base_urls'], $defaultVersion);
         $container->setDefinition('assets._default_package', $defaultPackage);
 
+        // used by the asset mapper for the assets it resolves itself, which already carry a content hash
+        $container->setDefinition('assets._default_package_without_version', $this->createPackageDefinition($config['base_path'], $config['base_urls'], new Reference('assets.empty_version_strategy')));
+
         foreach ($config['packages'] as $name => $package) {
             if (null !== $package['version_strategy']) {
                 $version = new Reference($package['version_strategy']);
@@ -1486,6 +1531,10 @@ class FrameworkExtension extends Extension
 
         if (!$assetEnabled) {
             $container->removeDefinition('asset_mapper.asset_package');
+        } else {
+            $container->getDefinition('asset_mapper.asset_package')
+                ->replaceArgument(3, $config['server'] ? $config['public_prefix'] : null)
+                ->replaceArgument(5, $config['public_prefix']);
         }
 
         if (!$httpClientEnabled) {
@@ -1513,14 +1562,15 @@ class FrameworkExtension extends Extension
         $container->getDefinition('asset_mapper.public_assets_path_resolver')
             ->setArgument(0, $config['public_prefix']);
 
+        $parameterBag = $container->getParameterBag();
         $publicDirectory = $this->getPublicDirectory($container);
         $publicAssetsDirectory = rtrim($publicDirectory.'/'.ltrim($config['public_prefix'], '/'), '/');
         $container->getDefinition('asset_mapper.local_public_assets_filesystem')
-            ->setArgument(0, $publicDirectory)
+            ->setArgument(0, $parameterBag->escapeValue($publicDirectory))
         ;
 
         $container->getDefinition('asset_mapper.compiled_asset_mapper_config_reader')
-            ->setArgument(0, $publicAssetsDirectory);
+            ->setArgument(0, $parameterBag->escapeValue($publicAssetsDirectory));
 
         if (!$config['server']) {
             $container->removeDefinition('asset_mapper.dev_server_subscriber');
@@ -1681,9 +1731,12 @@ class FrameworkExtension extends Extension
 
             $dirs[] = $transPaths[] = \dirname($r->getFileName(), 2).'/Resources/translations';
         }
-        $defaultDir = $container->getParameterBag()->resolveValue($config['default_path']);
+        $parameterBag = $container->getParameterBag();
+        // the parameter bag returns paths in their escaped form, the filesystem needs the literal one
+        $defaultDir = $parameterBag->unescapeValue($parameterBag->resolveValue($config['default_path']));
         foreach ($container->getParameter('kernel.bundles_metadata') as $name => $bundle) {
-            if ($container->fileExists($dir = $bundle['path'].'/Resources/translations') || $container->fileExists($dir = $bundle['path'].'/translations')) {
+            $bundlePath = $parameterBag->unescapeValue($bundle['path']);
+            if ($container->fileExists($dir = $bundlePath.'/Resources/translations') || $container->fileExists($dir = $bundlePath.'/translations')) {
                 $dirs[] = $transPaths[] = $dir;
             } else {
                 $nonExistingDirs[] = $dir;
@@ -1699,11 +1752,11 @@ class FrameworkExtension extends Extension
         }
 
         if ($container->hasDefinition('console.command.translation_debug')) {
-            $container->getDefinition('console.command.translation_debug')->replaceArgument(5, $transPaths);
+            $container->getDefinition('console.command.translation_debug')->replaceArgument(5, $parameterBag->escapeValue($transPaths));
         }
 
         if ($container->hasDefinition('console.command.translation_extract')) {
-            $container->getDefinition('console.command.translation_extract')->replaceArgument(6, $transPaths);
+            $container->getDefinition('console.command.translation_extract')->replaceArgument(6, $parameterBag->escapeValue($transPaths));
         }
 
         if (null === $defaultDir) {
@@ -1722,7 +1775,7 @@ class FrameworkExtension extends Extension
                 $finder = Finder::create()
                     ->followLinks()
                     ->files()
-                    ->filter(fn (\SplFileInfo $file) => 2 <= substr_count($file->getBasename(), '.') && preg_match('/\.\w+$/', $file->getBasename()))
+                    ->filter(static fn (\SplFileInfo $file) => 2 <= substr_count($file->getBasename(), '.') && preg_match('/\.\w+$/', $file->getBasename()))
                     ->in($dir)
                     ->sortByName()
                 ;
@@ -1737,15 +1790,15 @@ class FrameworkExtension extends Extension
                 }
             }
 
-            $projectDir = $container->getParameter('kernel.project_dir');
+            $projectDir = $parameterBag->unescapeValue($container->getParameter('kernel.project_dir'));
 
             $options = array_merge(
                 $translator->getArgument(4),
                 [
-                    'resource_files' => $files,
-                    'scanned_directories' => $scannedDirectories = array_merge($dirs, $nonExistingDirs),
+                    'resource_files' => $parameterBag->escapeValue($files),
+                    'scanned_directories' => $parameterBag->escapeValue($scannedDirectories = array_merge($dirs, $nonExistingDirs)),
                     'cache_vary' => [
-                        'scanned_directories' => array_map(fn ($dir) => str_starts_with($dir, $projectDir.'/') ? substr($dir, 1 + \strlen($projectDir)) : $dir, $scannedDirectories),
+                        'scanned_directories' => $parameterBag->escapeValue(array_map(static fn ($dir) => str_starts_with($dir, $projectDir.'/') ? substr($dir, 1 + \strlen($projectDir)) : $dir, $scannedDirectories)),
                     ],
                 ]
             );
@@ -1903,8 +1956,10 @@ class FrameworkExtension extends Extension
 
     private function registerValidatorMapping(ContainerBuilder $container, array $config, array &$files): void
     {
-        $fileRecorder = function ($extension, $path) use (&$files) {
-            $files['yaml' === $extension ? 'yml' : $extension][] = $path;
+        $parameterBag = $container->getParameterBag();
+        // mapping files are collected from the filesystem as literals and handed back to the container
+        $fileRecorder = static function ($extension, $path) use (&$files, $parameterBag) {
+            $files['yaml' === $extension ? 'yml' : $extension][] = $parameterBag->escapeValue($path);
         };
 
         if (!ContainerBuilder::willBeAvailable('symfony/form', Form::class, ['symfony/framework-bundle', 'symfony/validator'])) {
@@ -1915,7 +1970,8 @@ class FrameworkExtension extends Extension
         }
 
         foreach ($container->getParameter('kernel.bundles_metadata') as $bundle) {
-            $configDir = is_dir($bundle['path'].'/Resources/config') ? $bundle['path'].'/Resources/config' : $bundle['path'].'/config';
+            $bundlePath = $parameterBag->unescapeValue($bundle['path']);
+            $configDir = is_dir($bundlePath.'/Resources/config') ? $bundlePath.'/Resources/config' : $bundlePath.'/config';
 
             if (
                 $container->fileExists($file = $configDir.'/validation.yaml', false)
@@ -1933,29 +1989,29 @@ class FrameworkExtension extends Extension
             }
         }
 
-        $projectDir = $container->getParameter('kernel.project_dir');
+        $projectDir = $parameterBag->unescapeValue($container->getParameter('kernel.project_dir'));
         if ($container->fileExists($dir = $projectDir.'/config/validator', '/^$/')) {
             $this->registerMappingFilesFromDir($dir, $fileRecorder);
         }
 
-        $this->registerMappingFilesFromConfig($container, $config, $fileRecorder);
+        $this->registerMappingFilesFromConfig($container, $config, $fileRecorder, false);
     }
 
     private function registerMappingFilesFromDir(string $dir, callable $fileRecorder): void
     {
-        foreach (Finder::create()->followLinks()->files()->in($dir)->name('/\.(xml|ya?ml)$/')->sortByName() as $file) {
+        foreach (Finder::create()->followLinks()->files()->in($dir)->name(self::MAPPING_FILE_PATTERN)->sortByName() as $file) {
             $fileRecorder($file->getExtension(), $file->getRealPath());
         }
     }
 
-    private function registerMappingFilesFromConfig(ContainerBuilder $container, array $config, callable $fileRecorder): void
+    private function registerMappingFilesFromConfig(ContainerBuilder $container, array $config, callable $fileRecorder, bool $trackContents): void
     {
-        foreach ($config['mapping']['paths'] as $path) {
+        foreach ($container->getParameterBag()->unescapeValue($config['mapping']['paths']) as $path) {
             if (is_dir($path)) {
                 $this->registerMappingFilesFromDir($path, $fileRecorder);
-                $container->addResource(new DirectoryResource($path, '/^$/'));
-            } elseif ($container->fileExists($path, false)) {
-                if (!preg_match('/\.(xml|ya?ml)$/', $path, $matches)) {
+                $container->addResource(new DirectoryResource($path, $trackContents ? self::MAPPING_FILE_PATTERN : '/^$/'));
+            } elseif ($container->fileExists($path, $trackContents)) {
+                if (!preg_match(self::MAPPING_FILE_PATTERN, $path, $matches)) {
                     throw new \RuntimeException(\sprintf('Unsupported mapping type in "%s", supported types are XML & Yaml.', $path));
                 }
                 $fileRecorder($matches[1], $path);
@@ -2105,12 +2161,25 @@ class FrameworkExtension extends Extension
             $container->removeDefinition('serializer.name_converter.snake_case_to_camel_case');
         }
 
-        if ($container->getParameter('kernel.debug')) {
-            $container->removeDefinition('serializer.mapping.cache_class_metadata_factory');
-        }
-
         if (!$this->readConfigEnabled('translator', $container, $config)) {
             $container->removeDefinition('serializer.normalizer.translatable');
+        }
+
+        $attributesEnabled = isset($config['enable_attributes']) && $config['enable_attributes'];
+
+        // attribute metadata is read from the classes at runtime, so it cannot be cached in debug
+        // mode; metadata read from mapping files can be, because the container is rebuilt when one
+        // of these files changes, which clears the pool the metadata is stored in
+        $cacheMetadata = !$attributesEnabled || !$container->getParameter('kernel.debug');
+        $mappingDirPattern = $cacheMetadata ? self::MAPPING_FILE_PATTERN : '/^$/';
+
+        if (!$cacheMetadata) {
+            $container->removeDefinition('serializer.mapping.cache_class_metadata_factory');
+        } elseif ($container->getParameter('kernel.debug')) {
+            // the PHP file behind "serializer.mapping.cache.symfony" is written by an optional cache
+            // warmer, which does not run when the container is rebuilt while handling a request
+            $container->getDefinition('serializer.mapping.cache_class_metadata_factory')
+                ->replaceArgument(1, new Reference('cache.serializer'));
         }
 
         $serializerLoaders = [];
@@ -2148,36 +2217,39 @@ class FrameworkExtension extends Extension
             $container->removeDefinition('serializer.mapping.attribute_services_loader');
         }
 
-        $fileRecorder = function ($extension, $path) use (&$serializerLoaders) {
-            $definition = new Definition(\in_array($extension, ['yaml', 'yml'], true) ? YamlFileLoader::class : XmlFileLoader::class, [$path]);
+        $parameterBag = $container->getParameterBag();
+        // mapping files are collected from the filesystem as literals and handed back to the container
+        $fileRecorder = static function ($extension, $path) use (&$serializerLoaders, $parameterBag) {
+            $definition = new Definition(\in_array($extension, ['yaml', 'yml'], true) ? YamlFileLoader::class : XmlFileLoader::class, [$parameterBag->escapeValue($path)]);
             $serializerLoaders[] = $definition;
         };
 
         foreach ($container->getParameter('kernel.bundles_metadata') as $bundle) {
-            $configDir = is_dir($bundle['path'].'/Resources/config') ? $bundle['path'].'/Resources/config' : $bundle['path'].'/config';
+            $bundlePath = $parameterBag->unescapeValue($bundle['path']);
+            $configDir = is_dir($bundlePath.'/Resources/config') ? $bundlePath.'/Resources/config' : $bundlePath.'/config';
 
-            if ($container->fileExists($file = $configDir.'/serialization.xml', false)) {
+            if ($container->fileExists($file = $configDir.'/serialization.xml', $cacheMetadata)) {
                 $fileRecorder('xml', $file);
             }
 
             if (
-                $container->fileExists($file = $configDir.'/serialization.yaml', false)
-                || $container->fileExists($file = $configDir.'/serialization.yml', false)
+                $container->fileExists($file = $configDir.'/serialization.yaml', $cacheMetadata)
+                || $container->fileExists($file = $configDir.'/serialization.yml', $cacheMetadata)
             ) {
                 $fileRecorder('yml', $file);
             }
 
-            if ($container->fileExists($dir = $configDir.'/serialization', '/^$/')) {
+            if ($container->fileExists($dir = $configDir.'/serialization', $mappingDirPattern)) {
                 $this->registerMappingFilesFromDir($dir, $fileRecorder);
             }
         }
 
-        $projectDir = $container->getParameter('kernel.project_dir');
-        if ($container->fileExists($dir = $projectDir.'/config/serializer', '/^$/')) {
+        $projectDir = $parameterBag->unescapeValue($container->getParameter('kernel.project_dir'));
+        if ($container->fileExists($dir = $projectDir.'/config/serializer', $mappingDirPattern)) {
             $this->registerMappingFilesFromDir($dir, $fileRecorder);
         }
 
-        $this->registerMappingFilesFromConfig($container, $config, $fileRecorder);
+        $this->registerMappingFilesFromConfig($container, $config, $fileRecorder, $cacheMetadata);
 
         $chainLoader->replaceArgument(0, $serializerLoaders);
         $container->getDefinition('serializer.mapping.cache_warmer')->replaceArgument(0, $serializerLoaders);
@@ -2201,7 +2273,7 @@ class FrameworkExtension extends Extension
             $container->setParameter('.serializer.max_depth_handler', $config['max_depth_handler']);
         }
 
-        $container->getDefinition('serializer.normalizer.property')->setArgument(5, $defaultContext);
+        $container->getDefinition('serializer.normalizer.property')->setBindings(['array $defaultContext' => new BoundArgument($defaultContext, false)]);
 
         $container->setParameter('.serializer.named_serializers', $config['named_serializers'] ?? []);
 
@@ -2230,6 +2302,17 @@ class FrameworkExtension extends Extension
         $container->setParameter('.json_streamer.lazy_ghosts_dir', '%kernel.cache_dir%/json_streamer/lazy_ghost');
 
         if (\PHP_VERSION_ID >= 80400) {
+            $container->removeDefinition('.json_streamer.cache_warmer.lazy_ghost');
+        }
+
+        // forward compatibility with "symfony/json-streamer" 8.0+
+        if (!method_exists(PropertyMetadata::class, 'getNativeToStreamValueTransformer')) {
+            $reader = $container->getDefinition('json_streamer.stream_reader');
+
+            $args = $reader->getArguments();
+            unset($args[4]);
+
+            $reader->setArguments($args);
             $container->removeDefinition('.json_streamer.cache_warmer.lazy_ghost');
         }
     }
@@ -2309,7 +2392,7 @@ class FrameworkExtension extends Extension
         }
 
         foreach ($config['resources'] as $resourceName => $resourceStores) {
-            if (0 === \count($resourceStores)) {
+            if (!$resourceStores) {
                 continue;
             }
 
@@ -2358,6 +2441,10 @@ class FrameworkExtension extends Extension
 
     private function registerSemaphoreConfiguration(array $config, ContainerBuilder $container, PhpFileLoader $loader): void
     {
+        if (!class_exists(Semaphore::class)) {
+            throw new LogicException('Semaphore support cannot be enabled as the Semaphore component is not installed. Try running "composer require symfony/semaphore".');
+        }
+
         $loader->load('semaphore.php');
 
         foreach ($config['resources'] as $resourceName => $resourceStore) {
@@ -2497,6 +2584,10 @@ class FrameworkExtension extends Extension
                 // argument to add_bus_name_stamp_middleware
                 if ('add_bus_name_stamp_middleware' === $middlewareItem['id']) {
                     $middleware[$key]['arguments'] = [$busId];
+                }
+
+                if ('doctrine_open_transaction_logger' === $middlewareItem['id'] && isset($middleware[$key]['arguments'][0])) {
+                    $middleware[$key]['arguments'] = ['$entityManagerName' => $middleware[$key]['arguments'][0]];
                 }
             }
 
@@ -2650,6 +2741,10 @@ class FrameworkExtension extends Extension
             $messageToSerializersMapping[$message] = array_keys($messageToSerializersMapping[$message]);
         }
 
+        // Transports can carry any message class regardless of routing, so every transport
+        // serializer must be decoration-eligible whenever signing is requested.
+        $messageToSerializersMapping['*'] = array_values(array_unique($serializerIds));
+
         $container->getDefinition('messenger.signing_serializer')
             ->replaceArgument(2, $messageToSerializersMapping);
 
@@ -2667,7 +2762,7 @@ class FrameworkExtension extends Extension
                 ->replaceArgument(0, $transportRateLimiterReferences);
         }
 
-        if (\count($failureTransports) > 0) {
+        if ($failureTransports) {
             if ($this->hasConsole()) {
                 $container->getDefinition('console.command.messenger_failed_messages_retry')
                     ->replaceArgument(0, $config['failure_transport']);
@@ -2679,7 +2774,8 @@ class FrameworkExtension extends Extension
 
             $failureTransportsByTransportNameServiceLocator = ServiceLocatorTagPass::register($container, $failureTransportReferencesByTransportName);
             $container->getDefinition('messenger.failure.send_failed_message_to_failure_transport_listener')
-                ->replaceArgument(0, $failureTransportsByTransportNameServiceLocator);
+                ->replaceArgument(0, $failureTransportsByTransportNameServiceLocator)
+                ->replaceArgument(2, $failureTransportsByName);
         } else {
             $container->removeDefinition('messenger.failure.send_failed_message_to_failure_transport_listener');
             $container->removeDefinition('console.command.messenger_failed_messages_retry');
@@ -2816,7 +2912,7 @@ class FrameworkExtension extends Extension
         unset($options['retry_failed']);
         $defaultUriTemplateVars = $options['vars'] ?? [];
         unset($options['vars']);
-        $container->getDefinition('http_client.transport')->setArguments([$options, $config['max_host_connections'] ?? 6]);
+        $container->getDefinition('http_client.transport')->setArguments([$options, $config['max_host_connections'] ?? 6, 0]);
 
         if (!class_exists(PingWebhookMessageHandler::class)) {
             $container->removeDefinition('http_client.messenger.ping_webhook_handler');
@@ -3021,7 +3117,7 @@ class FrameworkExtension extends Extension
 
         $loader->load('mailer.php');
         $loader->load('mailer_transports.php');
-        if (!\count($config['transports']) && null === $config['dsn']) {
+        if (!$config['transports'] && null === $config['dsn']) {
             $config['dsn'] = 'smtp://null';
         }
         $transports = $config['dsn'] ? ['main' => $config['dsn']] : $config['transports'];
@@ -3035,58 +3131,31 @@ class FrameworkExtension extends Extension
         }
 
         $classToServices = [
-            MailerBridge\AhaSend\Transport\AhaSendTransportFactory::class => 'mailer.transport_factory.ahasend',
-            MailerBridge\Azure\Transport\AzureTransportFactory::class => 'mailer.transport_factory.azure',
-            MailerBridge\Brevo\Transport\BrevoTransportFactory::class => 'mailer.transport_factory.brevo',
-            MailerBridge\Google\Transport\GmailTransportFactory::class => 'mailer.transport_factory.gmail',
-            MailerBridge\Infobip\Transport\InfobipTransportFactory::class => 'mailer.transport_factory.infobip',
-            MailerBridge\MailerSend\Transport\MailerSendTransportFactory::class => 'mailer.transport_factory.mailersend',
-            MailerBridge\Mailgun\Transport\MailgunTransportFactory::class => 'mailer.transport_factory.mailgun',
-            MailerBridge\Mailjet\Transport\MailjetTransportFactory::class => 'mailer.transport_factory.mailjet',
-            MailerBridge\Mailomat\Transport\MailomatTransportFactory::class => 'mailer.transport_factory.mailomat',
-            MailerBridge\MailPace\Transport\MailPaceTransportFactory::class => 'mailer.transport_factory.mailpace',
-            MailerBridge\Mailchimp\Transport\MandrillTransportFactory::class => 'mailer.transport_factory.mailchimp',
-            MailerBridge\MicrosoftGraph\Transport\MicrosoftGraphTransportFactory::class => 'mailer.transport_factory.microsoftgraph',
-            MailerBridge\Postal\Transport\PostalTransportFactory::class => 'mailer.transport_factory.postal',
-            MailerBridge\Postmark\Transport\PostmarkTransportFactory::class => 'mailer.transport_factory.postmark',
-            MailerBridge\Mailtrap\Transport\MailtrapTransportFactory::class => 'mailer.transport_factory.mailtrap',
-            MailerBridge\Resend\Transport\ResendTransportFactory::class => 'mailer.transport_factory.resend',
-            MailerBridge\Scaleway\Transport\ScalewayTransportFactory::class => 'mailer.transport_factory.scaleway',
-            MailerBridge\Sendgrid\Transport\SendgridTransportFactory::class => 'mailer.transport_factory.sendgrid',
-            MailerBridge\Amazon\Transport\SesTransportFactory::class => 'mailer.transport_factory.amazon',
-            MailerBridge\Sweego\Transport\SweegoTransportFactory::class => 'mailer.transport_factory.sweego',
+            MailerBridge\AhaSend\Transport\AhaSendTransportFactory::class => ['symfony/aha-send-mailer', 'mailer.transport_factory.ahasend'],
+            MailerBridge\Azure\Transport\AzureTransportFactory::class => ['symfony/azure-mailer', 'mailer.transport_factory.azure'],
+            MailerBridge\Brevo\Transport\BrevoTransportFactory::class => ['symfony/brevo-mailer', 'mailer.transport_factory.brevo'],
+            MailerBridge\Google\Transport\GmailTransportFactory::class => ['symfony/google-mailer', 'mailer.transport_factory.gmail'],
+            MailerBridge\Infobip\Transport\InfobipTransportFactory::class => ['symfony/infobip-mailer', 'mailer.transport_factory.infobip'],
+            MailerBridge\MailerSend\Transport\MailerSendTransportFactory::class => ['symfony/mailer-send-mailer', 'mailer.transport_factory.mailersend'],
+            MailerBridge\Mailgun\Transport\MailgunTransportFactory::class => ['symfony/mailgun-mailer', 'mailer.transport_factory.mailgun'],
+            MailerBridge\Mailjet\Transport\MailjetTransportFactory::class => ['symfony/mailjet-mailer', 'mailer.transport_factory.mailjet'],
+            MailerBridge\Mailomat\Transport\MailomatTransportFactory::class => ['symfony/mailomat-mailer', 'mailer.transport_factory.mailomat'],
+            MailerBridge\MailPace\Transport\MailPaceTransportFactory::class => ['symfony/mail-pace-mailer', 'mailer.transport_factory.mailpace'],
+            MailerBridge\Mailchimp\Transport\MandrillTransportFactory::class => ['symfony/mailchimp-mailer', 'mailer.transport_factory.mailchimp'],
+            MailerBridge\MicrosoftGraph\Transport\MicrosoftGraphTransportFactory::class => ['symfony/microsoft-graph-mailer', 'mailer.transport_factory.microsoftgraph'],
+            MailerBridge\Postal\Transport\PostalTransportFactory::class => ['symfony/postal-mailer', 'mailer.transport_factory.postal'],
+            MailerBridge\Postmark\Transport\PostmarkTransportFactory::class => ['symfony/postmark-mailer', 'mailer.transport_factory.postmark'],
+            MailerBridge\Mailtrap\Transport\MailtrapTransportFactory::class => ['symfony/mailtrap-mailer', 'mailer.transport_factory.mailtrap'],
+            MailerBridge\Resend\Transport\ResendTransportFactory::class => ['symfony/resend-mailer', 'mailer.transport_factory.resend'],
+            MailerBridge\Scaleway\Transport\ScalewayTransportFactory::class => ['symfony/scaleway-mailer', 'mailer.transport_factory.scaleway'],
+            MailerBridge\Sendgrid\Transport\SendgridTransportFactory::class => ['symfony/sendgrid-mailer', 'mailer.transport_factory.sendgrid'],
+            MailerBridge\Amazon\Transport\SesTransportFactory::class => ['symfony/amazon-mailer', 'mailer.transport_factory.amazon'],
+            MailerBridge\Sweego\Transport\SweegoTransportFactory::class => ['symfony/sweego-mailer', 'mailer.transport_factory.sweego'],
         ];
 
-        foreach ($classToServices as $class => $service) {
-            $package = substr($service, \strlen('mailer.transport_factory.'));
-
-            if (!ContainerBuilder::willBeAvailable(\sprintf('symfony/%s-mailer', 'gmail' === $package ? 'google' : $package), $class, ['symfony/framework-bundle', 'symfony/mailer'])) {
+        foreach ($classToServices as $class => [$package, $service]) {
+            if (!ContainerBuilder::willBeAvailable($package, $class, ['symfony/framework-bundle', 'symfony/mailer'])) {
                 $container->removeDefinition($service);
-            }
-        }
-
-        if ($webhookEnabled) {
-            $webhookRequestParsers = [
-                MailerBridge\AhaSend\Webhook\AhaSendRequestParser::class => 'mailer.webhook.request_parser.ahasend',
-                MailerBridge\Brevo\Webhook\BrevoRequestParser::class => 'mailer.webhook.request_parser.brevo',
-                MailerBridge\MailerSend\Webhook\MailerSendRequestParser::class => 'mailer.webhook.request_parser.mailersend',
-                MailerBridge\Mailchimp\Webhook\MailchimpRequestParser::class => 'mailer.webhook.request_parser.mailchimp',
-                MailerBridge\Mailgun\Webhook\MailgunRequestParser::class => 'mailer.webhook.request_parser.mailgun',
-                MailerBridge\Mailjet\Webhook\MailjetRequestParser::class => 'mailer.webhook.request_parser.mailjet',
-                MailerBridge\Mailomat\Webhook\MailomatRequestParser::class => 'mailer.webhook.request_parser.mailomat',
-                MailerBridge\Postmark\Webhook\PostmarkRequestParser::class => 'mailer.webhook.request_parser.postmark',
-                MailerBridge\Mailtrap\Webhook\MailtrapRequestParser::class => 'mailer.webhook.request_parser.mailtrap',
-                MailerBridge\Resend\Webhook\ResendRequestParser::class => 'mailer.webhook.request_parser.resend',
-                MailerBridge\Sendgrid\Webhook\SendgridRequestParser::class => 'mailer.webhook.request_parser.sendgrid',
-                MailerBridge\Sweego\Webhook\SweegoRequestParser::class => 'mailer.webhook.request_parser.sweego',
-            ];
-
-            foreach ($webhookRequestParsers as $class => $service) {
-                $package = substr($service, \strlen('mailer.webhook.request_parser.'));
-
-                if (!ContainerBuilder::willBeAvailable(\sprintf('symfony/%s-mailer', 'gmail' === $package ? 'google' : $package), $class, ['symfony/framework-bundle', 'symfony/mailer'])) {
-                    $container->removeDefinition($service);
-                }
             }
         }
 
@@ -3156,6 +3225,30 @@ class FrameworkExtension extends Extension
 
         if ($webhookEnabled) {
             $loader->load('mailer_webhook.php');
+
+            $debug = $container->getParameter('kernel.debug');
+            $webhookRequestParsers = [
+                MailerBridge\AhaSend\Webhook\AhaSendRequestParser::class => ['symfony/aha-send-mailer', 'mailer.webhook.request_parser.ahasend'],
+                MailerBridge\Brevo\Webhook\BrevoRequestParser::class => ['symfony/brevo-mailer', 'mailer.webhook.request_parser.brevo'],
+                MailerBridge\MailerSend\Webhook\MailerSendRequestParser::class => ['symfony/mailer-send-mailer', 'mailer.webhook.request_parser.mailersend'],
+                MailerBridge\Mailchimp\Webhook\MailchimpRequestParser::class => ['symfony/mailchimp-mailer', 'mailer.webhook.request_parser.mailchimp'],
+                MailerBridge\Mailgun\Webhook\MailgunRequestParser::class => ['symfony/mailgun-mailer', 'mailer.webhook.request_parser.mailgun'],
+                MailerBridge\Mailjet\Webhook\MailjetRequestParser::class => ['symfony/mailjet-mailer', 'mailer.webhook.request_parser.mailjet'],
+                MailerBridge\Mailomat\Webhook\MailomatRequestParser::class => ['symfony/mailomat-mailer', 'mailer.webhook.request_parser.mailomat'],
+                MailerBridge\Postmark\Webhook\PostmarkRequestParser::class => ['symfony/postmark-mailer', 'mailer.webhook.request_parser.postmark'],
+                MailerBridge\Mailtrap\Webhook\MailtrapRequestParser::class => ['symfony/mailtrap-mailer', 'mailer.webhook.request_parser.mailtrap'],
+                MailerBridge\Resend\Webhook\ResendRequestParser::class => ['symfony/resend-mailer', 'mailer.webhook.request_parser.resend'],
+                MailerBridge\Sendgrid\Webhook\SendgridRequestParser::class => ['symfony/sendgrid-mailer', 'mailer.webhook.request_parser.sendgrid'],
+                MailerBridge\Sweego\Webhook\SweegoRequestParser::class => ['symfony/sweego-mailer', 'mailer.webhook.request_parser.sweego'],
+            ];
+
+            foreach ($webhookRequestParsers as $class => [$package, $service]) {
+                if (!ContainerBuilder::willBeAvailable($package, $class, ['symfony/framework-bundle', 'symfony/mailer'])) {
+                    $container->removeDefinition($service);
+                } elseif ($debug && \defined($class.'::PROVIDER_IPS')) {
+                    $container->getDefinition($service)->setArgument('$allowedIPs', [...$class::PROVIDER_IPS, '127.0.0.1']);
+                }
+            }
         }
     }
 
@@ -3224,105 +3317,103 @@ class FrameworkExtension extends Extension
             ->addTag('texter.transport_factory');
 
         $classToServices = [
-            NotifierBridge\AllMySms\AllMySmsTransportFactory::class => 'notifier.transport_factory.all-my-sms',
-            NotifierBridge\AmazonSns\AmazonSnsTransportFactory::class => 'notifier.transport_factory.amazon-sns',
-            NotifierBridge\Bandwidth\BandwidthTransportFactory::class => 'notifier.transport_factory.bandwidth',
-            NotifierBridge\Bluesky\BlueskyTransportFactory::class => 'notifier.transport_factory.bluesky',
-            NotifierBridge\Brevo\BrevoTransportFactory::class => 'notifier.transport_factory.brevo',
-            NotifierBridge\Chatwork\ChatworkTransportFactory::class => 'notifier.transport_factory.chatwork',
-            NotifierBridge\Clickatell\ClickatellTransportFactory::class => 'notifier.transport_factory.clickatell',
-            NotifierBridge\ClickSend\ClickSendTransportFactory::class => 'notifier.transport_factory.click-send',
-            NotifierBridge\ContactEveryone\ContactEveryoneTransportFactory::class => 'notifier.transport_factory.contact-everyone',
-            NotifierBridge\Discord\DiscordTransportFactory::class => 'notifier.transport_factory.discord',
-            NotifierBridge\Engagespot\EngagespotTransportFactory::class => 'notifier.transport_factory.engagespot',
-            NotifierBridge\Esendex\EsendexTransportFactory::class => 'notifier.transport_factory.esendex',
-            NotifierBridge\Expo\ExpoTransportFactory::class => 'notifier.transport_factory.expo',
-            NotifierBridge\Firebase\FirebaseTransportFactory::class => 'notifier.transport_factory.firebase',
-            NotifierBridge\FortySixElks\FortySixElksTransportFactory::class => 'notifier.transport_factory.forty-six-elks',
-            NotifierBridge\FreeMobile\FreeMobileTransportFactory::class => 'notifier.transport_factory.free-mobile',
-            NotifierBridge\GatewayApi\GatewayApiTransportFactory::class => 'notifier.transport_factory.gateway-api',
-            NotifierBridge\GoIp\GoIpTransportFactory::class => 'notifier.transport_factory.go-ip',
-            NotifierBridge\GoogleChat\GoogleChatTransportFactory::class => 'notifier.transport_factory.google-chat',
-            NotifierBridge\Infobip\InfobipTransportFactory::class => 'notifier.transport_factory.infobip',
-            NotifierBridge\Iqsms\IqsmsTransportFactory::class => 'notifier.transport_factory.iqsms',
-            NotifierBridge\Isendpro\IsendproTransportFactory::class => 'notifier.transport_factory.isendpro',
-            NotifierBridge\JoliNotif\JoliNotifTransportFactory::class => 'notifier.transport_factory.joli-notif',
-            NotifierBridge\KazInfoTeh\KazInfoTehTransportFactory::class => 'notifier.transport_factory.kaz-info-teh',
-            NotifierBridge\LightSms\LightSmsTransportFactory::class => 'notifier.transport_factory.light-sms',
-            NotifierBridge\LineBot\LineBotTransportFactory::class => 'notifier.transport_factory.line-bot',
-            NotifierBridge\LineNotify\LineNotifyTransportFactory::class => 'notifier.transport_factory.line-notify',
-            NotifierBridge\LinkedIn\LinkedInTransportFactory::class => 'notifier.transport_factory.linked-in',
-            NotifierBridge\Lox24\Lox24TransportFactory::class => 'notifier.transport_factory.lox24',
-            NotifierBridge\Mailjet\MailjetTransportFactory::class => 'notifier.transport_factory.mailjet',
-            NotifierBridge\Mastodon\MastodonTransportFactory::class => 'notifier.transport_factory.mastodon',
-            NotifierBridge\Matrix\MatrixTransportFactory::class => 'notifier.transport_factory.matrix',
-            NotifierBridge\Mattermost\MattermostTransportFactory::class => 'notifier.transport_factory.mattermost',
-            NotifierBridge\Mercure\MercureTransportFactory::class => 'notifier.transport_factory.mercure',
-            NotifierBridge\MessageBird\MessageBirdTransportFactory::class => 'notifier.transport_factory.message-bird',
-            NotifierBridge\MessageMedia\MessageMediaTransportFactory::class => 'notifier.transport_factory.message-media',
-            NotifierBridge\MicrosoftTeams\MicrosoftTeamsTransportFactory::class => 'notifier.transport_factory.microsoft-teams',
-            NotifierBridge\Mobyt\MobytTransportFactory::class => 'notifier.transport_factory.mobyt',
-            NotifierBridge\Novu\NovuTransportFactory::class => 'notifier.transport_factory.novu',
-            NotifierBridge\Ntfy\NtfyTransportFactory::class => 'notifier.transport_factory.ntfy',
-            NotifierBridge\Octopush\OctopushTransportFactory::class => 'notifier.transport_factory.octopush',
-            NotifierBridge\OneSignal\OneSignalTransportFactory::class => 'notifier.transport_factory.one-signal',
-            NotifierBridge\OrangeSms\OrangeSmsTransportFactory::class => 'notifier.transport_factory.orange-sms',
-            NotifierBridge\OvhCloud\OvhCloudTransportFactory::class => 'notifier.transport_factory.ovh-cloud',
-            NotifierBridge\PagerDuty\PagerDutyTransportFactory::class => 'notifier.transport_factory.pager-duty',
-            NotifierBridge\Plivo\PlivoTransportFactory::class => 'notifier.transport_factory.plivo',
-            NotifierBridge\Primotexto\PrimotextoTransportFactory::class => 'notifier.transport_factory.primotexto',
-            NotifierBridge\Pushover\PushoverTransportFactory::class => 'notifier.transport_factory.pushover',
-            NotifierBridge\Pushy\PushyTransportFactory::class => 'notifier.transport_factory.pushy',
-            NotifierBridge\Redlink\RedlinkTransportFactory::class => 'notifier.transport_factory.redlink',
-            NotifierBridge\RingCentral\RingCentralTransportFactory::class => 'notifier.transport_factory.ring-central',
-            NotifierBridge\RocketChat\RocketChatTransportFactory::class => 'notifier.transport_factory.rocket-chat',
-            NotifierBridge\Sendberry\SendberryTransportFactory::class => 'notifier.transport_factory.sendberry',
-            NotifierBridge\Sipgate\SipgateTransportFactory::class => 'notifier.transport_factory.sipgate',
-            NotifierBridge\SimpleTextin\SimpleTextinTransportFactory::class => 'notifier.transport_factory.simple-textin',
-            NotifierBridge\Sevenio\SevenIoTransportFactory::class => 'notifier.transport_factory.sevenio',
-            NotifierBridge\Sinch\SinchTransportFactory::class => 'notifier.transport_factory.sinch',
-            NotifierBridge\Slack\SlackTransportFactory::class => 'notifier.transport_factory.slack',
-            NotifierBridge\Sms77\Sms77TransportFactory::class => 'notifier.transport_factory.sms77',
-            NotifierBridge\Smsapi\SmsapiTransportFactory::class => 'notifier.transport_factory.smsapi',
-            NotifierBridge\SmsBiuras\SmsBiurasTransportFactory::class => 'notifier.transport_factory.sms-biuras',
-            NotifierBridge\Smsbox\SmsboxTransportFactory::class => 'notifier.transport_factory.smsbox',
-            NotifierBridge\Smsc\SmscTransportFactory::class => 'notifier.transport_factory.smsc',
-            NotifierBridge\SmsFactor\SmsFactorTransportFactory::class => 'notifier.transport_factory.sms-factor',
-            NotifierBridge\Smsmode\SmsmodeTransportFactory::class => 'notifier.transport_factory.smsmode',
-            NotifierBridge\SmsSluzba\SmsSluzbaTransportFactory::class => 'notifier.transport_factory.sms-sluzba',
-            NotifierBridge\Smsense\SmsenseTransportFactory::class => 'notifier.transport_factory.smsense',
-            NotifierBridge\SpotHit\SpotHitTransportFactory::class => 'notifier.transport_factory.spot-hit',
-            NotifierBridge\Sweego\SweegoTransportFactory::class => 'notifier.transport_factory.sweego',
-            NotifierBridge\Telegram\TelegramTransportFactory::class => 'notifier.transport_factory.telegram',
-            NotifierBridge\Telnyx\TelnyxTransportFactory::class => 'notifier.transport_factory.telnyx',
-            NotifierBridge\Termii\TermiiTransportFactory::class => 'notifier.transport_factory.termii',
-            NotifierBridge\TurboSms\TurboSmsTransportFactory::class => 'notifier.transport_factory.turbo-sms',
-            NotifierBridge\Twilio\TwilioTransportFactory::class => 'notifier.transport_factory.twilio',
-            NotifierBridge\Twitter\TwitterTransportFactory::class => 'notifier.transport_factory.twitter',
-            NotifierBridge\Unifonic\UnifonicTransportFactory::class => 'notifier.transport_factory.unifonic',
-            NotifierBridge\Vonage\VonageTransportFactory::class => 'notifier.transport_factory.vonage',
-            NotifierBridge\Yunpian\YunpianTransportFactory::class => 'notifier.transport_factory.yunpian',
-            NotifierBridge\Zendesk\ZendeskTransportFactory::class => 'notifier.transport_factory.zendesk',
-            NotifierBridge\Zulip\ZulipTransportFactory::class => 'notifier.transport_factory.zulip',
+            NotifierBridge\AllMySms\AllMySmsTransportFactory::class => ['symfony/all-my-sms-notifier', 'notifier.transport_factory.all-my-sms'],
+            NotifierBridge\AmazonSns\AmazonSnsTransportFactory::class => ['symfony/amazon-sns-notifier', 'notifier.transport_factory.amazon-sns'],
+            NotifierBridge\Bandwidth\BandwidthTransportFactory::class => ['symfony/bandwidth-notifier', 'notifier.transport_factory.bandwidth'],
+            NotifierBridge\Bluesky\BlueskyTransportFactory::class => ['symfony/bluesky-notifier', 'notifier.transport_factory.bluesky'],
+            NotifierBridge\Brevo\BrevoTransportFactory::class => ['symfony/brevo-notifier', 'notifier.transport_factory.brevo'],
+            NotifierBridge\Chatwork\ChatworkTransportFactory::class => ['symfony/chatwork-notifier', 'notifier.transport_factory.chatwork'],
+            NotifierBridge\Clickatell\ClickatellTransportFactory::class => ['symfony/clickatell-notifier', 'notifier.transport_factory.clickatell'],
+            NotifierBridge\ClickSend\ClickSendTransportFactory::class => ['symfony/click-send-notifier', 'notifier.transport_factory.click-send'],
+            NotifierBridge\ContactEveryone\ContactEveryoneTransportFactory::class => ['symfony/contact-everyone-notifier', 'notifier.transport_factory.contact-everyone'],
+            NotifierBridge\Discord\DiscordTransportFactory::class => ['symfony/discord-notifier', 'notifier.transport_factory.discord'],
+            NotifierBridge\Engagespot\EngagespotTransportFactory::class => ['symfony/engagespot-notifier', 'notifier.transport_factory.engagespot'],
+            NotifierBridge\Esendex\EsendexTransportFactory::class => ['symfony/esendex-notifier', 'notifier.transport_factory.esendex'],
+            NotifierBridge\Expo\ExpoTransportFactory::class => ['symfony/expo-notifier', 'notifier.transport_factory.expo'],
+            NotifierBridge\Firebase\FirebaseTransportFactory::class => ['symfony/firebase-notifier', 'notifier.transport_factory.firebase'],
+            NotifierBridge\FortySixElks\FortySixElksTransportFactory::class => ['symfony/forty-six-elks-notifier', 'notifier.transport_factory.forty-six-elks'],
+            NotifierBridge\FreeMobile\FreeMobileTransportFactory::class => ['symfony/free-mobile-notifier', 'notifier.transport_factory.free-mobile'],
+            NotifierBridge\GatewayApi\GatewayApiTransportFactory::class => ['symfony/gateway-api-notifier', 'notifier.transport_factory.gateway-api'],
+            NotifierBridge\GoIp\GoIpTransportFactory::class => ['symfony/go-ip-notifier', 'notifier.transport_factory.go-ip'],
+            NotifierBridge\GoogleChat\GoogleChatTransportFactory::class => ['symfony/google-chat-notifier', 'notifier.transport_factory.google-chat'],
+            NotifierBridge\Infobip\InfobipTransportFactory::class => ['symfony/infobip-notifier', 'notifier.transport_factory.infobip'],
+            NotifierBridge\Iqsms\IqsmsTransportFactory::class => ['symfony/iqsms-notifier', 'notifier.transport_factory.iqsms'],
+            NotifierBridge\Isendpro\IsendproTransportFactory::class => ['symfony/isendpro-notifier', 'notifier.transport_factory.isendpro'],
+            NotifierBridge\JoliNotif\JoliNotifTransportFactory::class => ['symfony/joli-notif-notifier', 'notifier.transport_factory.joli-notif'],
+            NotifierBridge\KazInfoTeh\KazInfoTehTransportFactory::class => ['symfony/kaz-info-teh-notifier', 'notifier.transport_factory.kaz-info-teh'],
+            NotifierBridge\LightSms\LightSmsTransportFactory::class => ['symfony/light-sms-notifier', 'notifier.transport_factory.light-sms'],
+            NotifierBridge\LineBot\LineBotTransportFactory::class => ['symfony/line-bot-notifier', 'notifier.transport_factory.line-bot'],
+            NotifierBridge\LineNotify\LineNotifyTransportFactory::class => ['symfony/line-notify-notifier', 'notifier.transport_factory.line-notify'],
+            NotifierBridge\LinkedIn\LinkedInTransportFactory::class => ['symfony/linked-in-notifier', 'notifier.transport_factory.linked-in'],
+            NotifierBridge\Lox24\Lox24TransportFactory::class => ['symfony/lox24-notifier', 'notifier.transport_factory.lox24'],
+            NotifierBridge\Mailjet\MailjetTransportFactory::class => ['symfony/mailjet-notifier', 'notifier.transport_factory.mailjet'],
+            NotifierBridge\Mastodon\MastodonTransportFactory::class => ['symfony/mastodon-notifier', 'notifier.transport_factory.mastodon'],
+            NotifierBridge\Matrix\MatrixTransportFactory::class => ['symfony/matrix-notifier', 'notifier.transport_factory.matrix'],
+            NotifierBridge\Mattermost\MattermostTransportFactory::class => ['symfony/mattermost-notifier', 'notifier.transport_factory.mattermost'],
+            NotifierBridge\Mercure\MercureTransportFactory::class => ['symfony/mercure-notifier', 'notifier.transport_factory.mercure'],
+            NotifierBridge\MessageBird\MessageBirdTransportFactory::class => ['symfony/message-bird-notifier', 'notifier.transport_factory.message-bird'],
+            NotifierBridge\MessageMedia\MessageMediaTransportFactory::class => ['symfony/message-media-notifier', 'notifier.transport_factory.message-media'],
+            NotifierBridge\MicrosoftTeams\MicrosoftTeamsTransportFactory::class => ['symfony/microsoft-teams-notifier', 'notifier.transport_factory.microsoft-teams'],
+            NotifierBridge\Mobyt\MobytTransportFactory::class => ['symfony/mobyt-notifier', 'notifier.transport_factory.mobyt'],
+            NotifierBridge\Novu\NovuTransportFactory::class => ['symfony/novu-notifier', 'notifier.transport_factory.novu'],
+            NotifierBridge\Ntfy\NtfyTransportFactory::class => ['symfony/ntfy-notifier', 'notifier.transport_factory.ntfy'],
+            NotifierBridge\Octopush\OctopushTransportFactory::class => ['symfony/octopush-notifier', 'notifier.transport_factory.octopush'],
+            NotifierBridge\OneSignal\OneSignalTransportFactory::class => ['symfony/one-signal-notifier', 'notifier.transport_factory.one-signal'],
+            NotifierBridge\OrangeSms\OrangeSmsTransportFactory::class => ['symfony/orange-sms-notifier', 'notifier.transport_factory.orange-sms'],
+            NotifierBridge\OvhCloud\OvhCloudTransportFactory::class => ['symfony/ovh-cloud-notifier', 'notifier.transport_factory.ovh-cloud'],
+            NotifierBridge\PagerDuty\PagerDutyTransportFactory::class => ['symfony/pager-duty-notifier', 'notifier.transport_factory.pager-duty'],
+            NotifierBridge\Plivo\PlivoTransportFactory::class => ['symfony/plivo-notifier', 'notifier.transport_factory.plivo'],
+            NotifierBridge\Primotexto\PrimotextoTransportFactory::class => ['symfony/primotexto-notifier', 'notifier.transport_factory.primotexto'],
+            NotifierBridge\Pushover\PushoverTransportFactory::class => ['symfony/pushover-notifier', 'notifier.transport_factory.pushover'],
+            NotifierBridge\Pushy\PushyTransportFactory::class => ['symfony/pushy-notifier', 'notifier.transport_factory.pushy'],
+            NotifierBridge\Redlink\RedlinkTransportFactory::class => ['symfony/redlink-notifier', 'notifier.transport_factory.redlink'],
+            NotifierBridge\RingCentral\RingCentralTransportFactory::class => ['symfony/ring-central-notifier', 'notifier.transport_factory.ring-central'],
+            NotifierBridge\RocketChat\RocketChatTransportFactory::class => ['symfony/rocket-chat-notifier', 'notifier.transport_factory.rocket-chat'],
+            NotifierBridge\Sendberry\SendberryTransportFactory::class => ['symfony/sendberry-notifier', 'notifier.transport_factory.sendberry'],
+            NotifierBridge\Sipgate\SipgateTransportFactory::class => ['symfony/sipgate-notifier', 'notifier.transport_factory.sipgate'],
+            NotifierBridge\SimpleTextin\SimpleTextinTransportFactory::class => ['symfony/simple-textin-notifier', 'notifier.transport_factory.simple-textin'],
+            NotifierBridge\Sevenio\SevenIoTransportFactory::class => ['symfony/sevenio-notifier', 'notifier.transport_factory.sevenio'],
+            NotifierBridge\Sinch\SinchTransportFactory::class => ['symfony/sinch-notifier', 'notifier.transport_factory.sinch'],
+            NotifierBridge\Slack\SlackTransportFactory::class => ['symfony/slack-notifier', 'notifier.transport_factory.slack'],
+            NotifierBridge\Sms77\Sms77TransportFactory::class => ['symfony/sms77-notifier', 'notifier.transport_factory.sms77'],
+            NotifierBridge\Smsapi\SmsapiTransportFactory::class => ['symfony/smsapi-notifier', 'notifier.transport_factory.smsapi'],
+            NotifierBridge\SmsBiuras\SmsBiurasTransportFactory::class => ['symfony/sms-biuras-notifier', 'notifier.transport_factory.sms-biuras'],
+            NotifierBridge\Smsbox\SmsboxTransportFactory::class => ['symfony/smsbox-notifier', 'notifier.transport_factory.smsbox'],
+            NotifierBridge\Smsc\SmscTransportFactory::class => ['symfony/smsc-notifier', 'notifier.transport_factory.smsc'],
+            NotifierBridge\SmsFactor\SmsFactorTransportFactory::class => ['symfony/sms-factor-notifier', 'notifier.transport_factory.sms-factor'],
+            NotifierBridge\Smsmode\SmsmodeTransportFactory::class => ['symfony/smsmode-notifier', 'notifier.transport_factory.smsmode'],
+            NotifierBridge\SmsSluzba\SmsSluzbaTransportFactory::class => ['symfony/sms-sluzba-notifier', 'notifier.transport_factory.sms-sluzba'],
+            NotifierBridge\Smsense\SmsenseTransportFactory::class => ['symfony/smsense-notifier', 'notifier.transport_factory.smsense'],
+            NotifierBridge\SpotHit\SpotHitTransportFactory::class => ['symfony/spot-hit-notifier', 'notifier.transport_factory.spot-hit'],
+            NotifierBridge\Sweego\SweegoTransportFactory::class => ['symfony/sweego-notifier', 'notifier.transport_factory.sweego'],
+            NotifierBridge\Telegram\TelegramTransportFactory::class => ['symfony/telegram-notifier', 'notifier.transport_factory.telegram'],
+            NotifierBridge\Telnyx\TelnyxTransportFactory::class => ['symfony/telnyx-notifier', 'notifier.transport_factory.telnyx'],
+            NotifierBridge\Termii\TermiiTransportFactory::class => ['symfony/termii-notifier', 'notifier.transport_factory.termii'],
+            NotifierBridge\TurboSms\TurboSmsTransportFactory::class => ['symfony/turbo-sms-notifier', 'notifier.transport_factory.turbo-sms'],
+            NotifierBridge\Twilio\TwilioTransportFactory::class => ['symfony/twilio-notifier', 'notifier.transport_factory.twilio'],
+            NotifierBridge\Twitter\TwitterTransportFactory::class => ['symfony/twitter-notifier', 'notifier.transport_factory.twitter'],
+            NotifierBridge\Unifonic\UnifonicTransportFactory::class => ['symfony/unifonic-notifier', 'notifier.transport_factory.unifonic'],
+            NotifierBridge\Vonage\VonageTransportFactory::class => ['symfony/vonage-notifier', 'notifier.transport_factory.vonage'],
+            NotifierBridge\Yunpian\YunpianTransportFactory::class => ['symfony/yunpian-notifier', 'notifier.transport_factory.yunpian'],
+            NotifierBridge\Zendesk\ZendeskTransportFactory::class => ['symfony/zendesk-notifier', 'notifier.transport_factory.zendesk'],
+            NotifierBridge\Zulip\ZulipTransportFactory::class => ['symfony/zulip-notifier', 'notifier.transport_factory.zulip'],
         ];
 
         $parentPackages = ['symfony/framework-bundle', 'symfony/notifier'];
 
-        foreach ($classToServices as $class => $service) {
-            $package = substr($service, \strlen('notifier.transport_factory.'));
-
-            if (!ContainerBuilder::willBeAvailable(\sprintf('symfony/%s-notifier', $package), $class, $parentPackages)) {
+        foreach ($classToServices as $class => [$package, $service]) {
+            if (!ContainerBuilder::willBeAvailable($package, $class, $parentPackages)) {
                 $container->removeDefinition($service);
             }
         }
 
         if (ContainerBuilder::willBeAvailable('symfony/mercure-notifier', NotifierBridge\Mercure\MercureTransportFactory::class, $parentPackages) && ContainerBuilder::willBeAvailable('symfony/mercure-bundle', MercureBundle::class, $parentPackages) && \in_array(MercureBundle::class, $container->getParameter('kernel.bundles'), true)) {
-            $container->getDefinition($classToServices[NotifierBridge\Mercure\MercureTransportFactory::class])
+            $container->getDefinition('notifier.transport_factory.mercure')
                 ->replaceArgument(0, new Reference(HubRegistry::class))
                 ->replaceArgument(1, new Reference('event_dispatcher', ContainerBuilder::NULL_ON_INVALID_REFERENCE))
                 ->addArgument(new Reference('http_client', ContainerBuilder::NULL_ON_INVALID_REFERENCE));
         } elseif (ContainerBuilder::willBeAvailable('symfony/mercure-notifier', NotifierBridge\Mercure\MercureTransportFactory::class, $parentPackages)) {
-            $container->removeDefinition($classToServices[NotifierBridge\Mercure\MercureTransportFactory::class]);
+            $container->removeDefinition('notifier.transport_factory.mercure');
         }
 
         // don't use ContainerBuilder::willBeAvailable() as these are not needed in production
@@ -3348,7 +3439,7 @@ class FrameworkExtension extends Extension
         }
 
         if (ContainerBuilder::willBeAvailable('symfony/bluesky-notifier', NotifierBridge\Bluesky\BlueskyTransportFactory::class, ['symfony/framework-bundle', 'symfony/notifier'])) {
-            $container->getDefinition($classToServices[NotifierBridge\Bluesky\BlueskyTransportFactory::class])
+            $container->getDefinition('notifier.transport_factory.bluesky')
                 ->addArgument(new Reference('logger'))
                 ->addArgument(new Reference('clock', ContainerBuilder::NULL_ON_INVALID_REFERENCE));
         }
@@ -3366,17 +3457,15 @@ class FrameworkExtension extends Extension
             $loader->load('notifier_webhook.php');
 
             $webhookRequestParsers = [
-                NotifierBridge\Lox24\Webhook\Lox24RequestParser::class => 'notifier.webhook.request_parser.lox24',
-                NotifierBridge\Smsbox\Webhook\SmsboxRequestParser::class => 'notifier.webhook.request_parser.smsbox',
-                NotifierBridge\Sweego\Webhook\SweegoRequestParser::class => 'notifier.webhook.request_parser.sweego',
-                NotifierBridge\Twilio\Webhook\TwilioRequestParser::class => 'notifier.webhook.request_parser.twilio',
-                NotifierBridge\Vonage\Webhook\VonageRequestParser::class => 'notifier.webhook.request_parser.vonage',
+                NotifierBridge\Lox24\Webhook\Lox24RequestParser::class => ['symfony/lox24-notifier', 'notifier.webhook.request_parser.lox24'],
+                NotifierBridge\Smsbox\Webhook\SmsboxRequestParser::class => ['symfony/smsbox-notifier', 'notifier.webhook.request_parser.smsbox'],
+                NotifierBridge\Sweego\Webhook\SweegoRequestParser::class => ['symfony/sweego-notifier', 'notifier.webhook.request_parser.sweego'],
+                NotifierBridge\Twilio\Webhook\TwilioRequestParser::class => ['symfony/twilio-notifier', 'notifier.webhook.request_parser.twilio'],
+                NotifierBridge\Vonage\Webhook\VonageRequestParser::class => ['symfony/vonage-notifier', 'notifier.webhook.request_parser.vonage'],
             ];
 
-            foreach ($webhookRequestParsers as $class => $service) {
-                $package = substr($service, \strlen('notifier.webhook.request_parser.'));
-
-                if (!ContainerBuilder::willBeAvailable(\sprintf('symfony/%s-notifier', $package), $class, ['symfony/framework-bundle', 'symfony/notifier'])) {
+            foreach ($webhookRequestParsers as $class => [$package, $service]) {
+                if (!ContainerBuilder::willBeAvailable($package, $class, ['symfony/framework-bundle', 'symfony/notifier'])) {
                     $container->removeDefinition($service);
                 }
             }
@@ -3441,7 +3530,7 @@ class FrameworkExtension extends Extension
                 ->addTag('rate_limiter', ['name' => $name]);
 
             if ('auto' === $limiterConfig['lock_factory']) {
-                $limiterConfig['lock_factory'] = $this->isInitializedConfigEnabled('lock') ? 'lock.factory' : null;
+                $limiterConfig['lock_factory'] = $container->hasAlias('lock.factory') ? 'lock.factory' : null;
             }
 
             if (null !== $limiterConfig['lock_factory']) {
@@ -3655,7 +3744,7 @@ class FrameworkExtension extends Extension
 
     private function getPublicDirectory(ContainerBuilder $container): string
     {
-        $projectDir = $container->getParameter('kernel.project_dir');
+        $projectDir = $container->getParameterBag()->unescapeValue($container->getParameter('kernel.project_dir'));
         $defaultPublicDir = $projectDir.'/public';
 
         $composerFilePath = $projectDir.'/composer.json';
