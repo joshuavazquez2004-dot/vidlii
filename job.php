@@ -1,11 +1,14 @@
 <?php
     /**
-     * Video converter / storage worker.
+     * Video storage worker.
      *
      * Uploaded files land in usfi/conv/. This worker hands each one to Vidara,
      * records the Vidara code so the site can play it, stores Vidara's own
      * thumbnail in the database, and then deletes the local copy so the
      * container never accumulates video files on disk.
+     *
+     * Vidara encodes asynchronously (a fresh upload reports status "queued"),
+     * so thumbnails that are not ready yet are filled in on a later run.
      */
     error_reporting(E_ALL & ~E_DEPRECATED & ~E_WARNING & ~E_NOTICE);
     require "vendor/autoload.php";
@@ -16,36 +19,74 @@
     $dotenv = \Dotenv\Dotenv::createImmutable(__dir__);
     $dotenv->load();
 
+    function db_connect() {
+        static $conn = null;
+        if ($conn !== null) {
+            return $conn;
+        }
+        $database = $_ENV["database"] ?? "";
+        if (!isset($database) || $database == "") {
+            return null;
+        }
+        $dsnParser = new \Doctrine\DBAL\Tools\DsnParser();
+        $conn = \Doctrine\DBAL\DriverManager::getConnection($dsnParser->parse($database));
+        return $conn;
+    }
+
     function db($query) {
-        $database = $_ENV["database"];
         $data = [];
-        if(isset($database) && $database != "") {
-            $dsnParser = new \Doctrine\DBAL\Tools\DsnParser();
-            $params = $dsnParser->parse($database);
-            $conn = \Doctrine\DBAL\DriverManager::getConnection($params);
-            try {
-                $stmt = $conn->prepare($query);
-                if(strtolower(substr($query, 0, strlen("select"))) == "select") {
-                    $result = $stmt->executeQuery();
-                    $datas = $result->fetchAssociative();
-                    // fetchAssociative() returns false when there is no row.
-                    $data = is_array($datas)
-                        ? ["count" => count($datas), "data" => $datas]
-                        : ["count" => 0, "data" => []];
-                } else {
-                    $result = $stmt->executeStatement();
-                    $data["status"] = (int)$result;
-                }
-            } catch(\Doctrine\DBAL\Exception $e) {
-                $data = ["status" => -1, "message" => $e->getMessage()];
+        $conn = db_connect();
+        if ($conn === null) {
+            return ["status" => -1, "message" => "Connection node is missing"];
+        }
+        try {
+            $stmt = $conn->prepare($query);
+            if (strtolower(substr(ltrim($query), 0, 6)) == "select") {
+                $datas = $stmt->executeQuery()->fetchAssociative();
+                // fetchAssociative() returns false when there is no row.
+                $data = is_array($datas)
+                    ? ["count" => count($datas), "data" => $datas]
+                    : ["count" => 0, "data" => []];
+            } else {
+                $data["status"] = (int) $stmt->executeStatement();
             }
-            $conn->close();
-        } else $data = ["status" => -1, "message" => "Connection node is missing"];
+        } catch (\Doctrine\DBAL\Exception $e) {
+            $data = ["status" => -1, "message" => $e->getMessage()];
+        }
         return $data;
     }
 
-    // ffprobe is only used to read the duration; no local transcoding happens
-    // because Vidara encodes the video itself.
+    function db_rows($query) {
+        $conn = db_connect();
+        if ($conn === null) {
+            return [];
+        }
+        try {
+            return $conn->prepare($query)->executeQuery()->fetchAllAssociative();
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /**
+     * Copy Vidara's generated thumbnail into the video row. Returns true when
+     * a thumbnail was stored; false while Vidara is still encoding.
+     */
+    function fill_thumbnail(VidaraStorage $Storage, string $Id, string $Code) {
+        if (!preg_match('/^[A-Za-z0-9]{11}$/', $Id) || !preg_match('/^[A-Za-z0-9]+$/', $Code)) {
+            return false;
+        }
+        $Info = $Storage->fileInfo($Code);
+        $Thumb = $Storage->fetchThumbnail($Info["player_img"] ?? "");
+        if ($Thumb === null) {
+            return false;
+        }
+        db("UPDATE videos SET thumbnail = '" . base64_encode($Thumb) . "' WHERE url = '$Id'");
+        return true;
+    }
+
+    // ffprobe only reads the duration; Vidara does the encoding, so no local
+    // transcode happens and no converted file is written to disk.
     $bin_path = (PHP_OS == "WINNT") ? "bin\\win" : "bin/linux";
     $ffprobe_path = (PHP_OS == "WINNT") ? "$bin_path\\ffprobe.exe" : "$bin_path/ffprobe";
     $ffprobe = \FFMpeg\FFProbe::create([
@@ -86,6 +127,7 @@
 
         // Already stored at Vidara: the local copy is no longer needed.
         if ($Existing !== "") {
+            fill_thumbnail($Storage, $Id, $Existing);
             @unlink($Path);
             continue;
         }
@@ -110,14 +152,19 @@
 
         db("UPDATE videos SET vidara_code = '$Code', vidara_embed = '$Embed', length = $Duration, status = 2 WHERE url = '$Id'");
 
-        // Reuse Vidara's generated thumbnail so nothing is stored on disk.
-        $Info  = $Storage->fileInfo($Code);
-        $Thumb = $Storage->fetchThumbnail($Info["player_img"] ?? "");
-        if ($Thumb !== null) {
-            db("UPDATE videos SET thumbnail = '" . base64_encode($Thumb) . "' WHERE url = '$Id'");
-        }
+        // Vidara usually still reports "queued" here, so this may be filled in
+        // by the backfill pass below on a later run.
+        fill_thumbnail($Storage, $Id, $Code);
 
         @unlink($Path);
         db("DELETE FROM converting WHERE url = '$Id'");
         echo "[$Id] stored at Vidara as $Code\n";
+    }
+
+    // Fill in thumbnails for videos whose encoding finished after upload.
+    $Missing = db_rows("SELECT url, vidara_code FROM videos WHERE vidara_code <> '' AND (thumbnail IS NULL OR LENGTH(thumbnail) < 100) LIMIT 20");
+    foreach ($Missing as $Row) {
+        if (fill_thumbnail($Storage, (string) $Row["url"], (string) $Row["vidara_code"])) {
+            echo "[{$Row['url']}] thumbnail stored from Vidara\n";
+        }
     }
