@@ -30,6 +30,7 @@
     // AUTOLOAD CLASSES
     spl_autoload_register(function ($class) { include ROOT_FOLDER."/_includes/_classes/" . $class . ".class.php"; });
     require_once ROOT_FOLDER."/_includes/PHPfunctions.php";
+    require_once ROOT_FOLDER."/_includes/vidara.php";
 
     // create folders
     if(!is_dir(ROOT_FOLDER."/cache"))

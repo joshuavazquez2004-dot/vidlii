@@ -121,6 +121,14 @@ SQL
     fi
 fi
 
+# --- video storage columns --------------------------------------------------
+# Databases created before Vidara support need these columns. MariaDB supports
+# ADD COLUMN IF NOT EXISTS, so this stays safe on every boot.
+mariadb --socket="$SOCKET" -u root "$DB_NAME" <<SQL || log "WARNING: could not add Vidara columns"
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS vidara_code varchar(32) NOT NULL DEFAULT '';
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS vidara_embed varchar(255) NOT NULL DEFAULT '';
+SQL
+
 # --- application configuration ---------------------------------------------
 # Always (re)written so a restart reuses the same database credentials.
 cat > "$APP_ROOT/.env" <<ENVFILE
@@ -151,5 +159,18 @@ while [ "$i" -lt 30 ]; do
     i=$((i + 1))
     sleep 1
 done
+
+# --- video storage worker ---------------------------------------------------
+# job.php hands uploaded files to Vidara and then deletes the local copy.
+# Nothing else invokes it, so run it on an interval; it exits by itself once
+# the queue is empty.
+(
+    cd "$APP_ROOT"
+    while :; do
+        php job.php >> /tmp/converter.log 2>&1 || true
+        sleep 30
+    done
+) &
+log "video storage worker started"
 
 exec nginx -c /tmp/nginx.conf -g 'daemon off;'

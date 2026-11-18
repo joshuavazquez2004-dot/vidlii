@@ -93,7 +93,14 @@
             </div>
         </noscript>
 		<div id="vtbl_pl">
-			<? require_once $_SERVER['DOCUMENT_ROOT']."/_templates/_layout/player.php"; ?>
+			<? $Vidara_Embed = vidara_embed_for($URL); ?>
+			<? if ($Status == 2 && $Vidara_Embed !== ""): ?>
+				<div class="vlPlayer" id="vidara-player">
+					<iframe src="<?= htmlspecialchars($Vidara_Embed, ENT_QUOTES) ?>" frameborder="0" allowfullscreen allow="autoplay; fullscreen; encrypted-media; picture-in-picture" style="width:100%;height:100%;min-height:480px;border:0;display:block;background:#000"></iframe>
+				</div>
+			<? else: ?>
+				<? require_once $_SERVER['DOCUMENT_ROOT']."/_templates/_layout/player.php"; ?>
+			<? endif ?>
 		</div><? if ($Status == 2) : ?><div id="vtbl_desc">
 			<? if ($Size == 1) : ?><script>expandPlayer();</script><? endif ?>
 			<? require_once("watch_widgets/Playlist.php"); ?>

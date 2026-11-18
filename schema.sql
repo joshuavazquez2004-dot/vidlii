@@ -725,7 +725,9 @@ CREATE TABLE `videos` (
   `shadowbanned_uploader` tinyint(1) NOT NULL DEFAULT '0',
   `status` tinyint(1) NOT NULL DEFAULT '1',
   `thumbs` tinyint(1) NOT NULL DEFAULT '-1',
-  `show_ads` tinyint(1) NOT NULL DEFAULT '1'
+  `show_ads` tinyint(1) NOT NULL DEFAULT '1',
+  `vidara_code` varchar(32) NOT NULL DEFAULT '',
+  `vidara_embed` varchar(255) NOT NULL DEFAULT ''
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- --------------------------------------------------------
